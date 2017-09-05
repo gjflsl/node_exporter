@@ -24,9 +24,9 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/gjflsl/node_exporter/collector/ganglia"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
-	"github.com/prometheus/node_exporter/collector/ganglia"
 )
 
 const (

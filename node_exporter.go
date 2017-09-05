@@ -24,11 +24,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gjflsl/node_exporter/collector"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
-	"github.com/prometheus/node_exporter/collector"
+	"net"
 )
 
 const (
@@ -129,12 +130,31 @@ func main() {
 		metricsPath       = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics.")
 		enabledCollectors = flag.String("collectors.enabled", filterAvailableCollectors(defaultCollectors), "Comma-separated list of collectors to use.")
 		printCollectors   = flag.Bool("collectors.print", false, "If true, print available collectors and exit.")
+		ipWhitelistString = flag.String("web.ip-whitelist", "0.0.0.0/0,::/0", "Set the whitelist of IP. Example: \"127.0.0.1,172.17.2.1/24,1080:0:0:0:8:800:200C:417A/128\"")
 	)
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Fprintln(os.Stdout, version.Print("node_exporter"))
 		os.Exit(0)
+	}
+
+	var ipWhitelist []*net.IPNet
+	for _, netIpString := range strings.Split(*ipWhitelistString, ",") {
+		ipAdd := net.ParseIP(netIpString)
+		if ipAdd != nil {
+			if ipAdd.To4() != nil {
+				netIpString += "/32"
+			} else {
+				netIpString += "/128"
+			}
+		}
+		_, netIp, err := net.ParseCIDR(netIpString)
+		if err != nil {
+			log.Fatalf("Add netip error: %s", err)
+		} else {
+			ipWhitelist = append(ipWhitelist, netIp)
+		}
 	}
 
 	log.Infoln("Starting node_exporter", version.Info())
@@ -169,11 +189,14 @@ func main() {
 		promhttp.HandlerOpts{
 			ErrorLog:      log.NewErrorLogger(),
 			ErrorHandling: promhttp.ContinueOnError,
-		})
+		}, ipWhitelist)
 
 	// TODO(ts): Remove deprecated and problematic InstrumentHandler usage.
-	http.Handle(*metricsPath, prometheus.InstrumentHandler("prometheus", handler))
+	http.Handle(*metricsPath, handler)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if promhttp.CheckInIpWhitelist(w, r, ipWhitelist) == false {
+			return
+		}
 		w.Write([]byte(`<html>
 			<head><title>Node Exporter</title></head>
 			<body>
