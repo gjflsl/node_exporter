@@ -22,12 +22,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gjflsl/node_exporter/collector"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 	"github.com/prometheus/common/version"
-	"github.com/prometheus/node_exporter/collector"
 	"gopkg.in/alecthomas/kingpin.v2"
+	"net"
 )
 
 const (
@@ -127,12 +128,31 @@ func main() {
 		metricsPath       = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
 		enabledCollectors = kingpin.Flag("collectors.enabled", "Comma-separated list of collectors to use.").Default(filterAvailableCollectors(defaultCollectors)).String()
 		printCollectors   = kingpin.Flag("collectors.print", "If true, print available collectors and exit.").Bool()
+		ipWhitelistString = kingpin.Flag("web.ip-whitelist", "Set the whitelist of IP. Example: \"127.0.0.1,172.17.2.1/24,1080:0:0:0:8:800:200C:417A/128\"").Default("0.0.0.0/0,::/0").String()
 	)
 
 	log.AddFlags(kingpin.CommandLine)
 	kingpin.Version(version.Print("node_exporter"))
 	kingpin.HelpFlag.Short('h')
 	kingpin.Parse()
+
+	var ipWhitelist []*net.IPNet
+	for _, netIpString := range strings.Split(*ipWhitelistString, ",") {
+		ipAdd := net.ParseIP(netIpString)
+		if ipAdd != nil {
+			if ipAdd.To4() != nil {
+				netIpString += "/32"
+			} else {
+				netIpString += "/128"
+			}
+		}
+		_, netIp, err := net.ParseCIDR(netIpString)
+		if err != nil {
+			log.Fatalf("Add netip error: %s", err)
+		} else {
+			ipWhitelist = append(ipWhitelist, netIp)
+		}
+	}
 
 	log.Infoln("Starting node_exporter", version.Info())
 	log.Infoln("Build context", version.BuildContext())
@@ -166,11 +186,14 @@ func main() {
 		promhttp.HandlerOpts{
 			ErrorLog:      log.NewErrorLogger(),
 			ErrorHandling: promhttp.ContinueOnError,
-		})
+		}, ipWhitelist)
 
 	// TODO(ts): Remove deprecated and problematic InstrumentHandler usage.
-	http.Handle(*metricsPath, prometheus.InstrumentHandler("prometheus", handler))
+	http.Handle(*metricsPath, handler)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if promhttp.CheckInIpWhitelist(w, r, ipWhitelist) == false {
+			return
+		}
 		w.Write([]byte(`<html>
 			<head><title>Node Exporter</title></head>
 			<body>
