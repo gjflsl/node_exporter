@@ -16,7 +16,8 @@ The [WMI exporter](https://github.com/martinlindhe/wmi_exporter) is recommended 
 There is varying support for collectors on each operating system. The tables
 below list all existing collectors and the supported systems.
 
-Which collectors are used is controlled by the `--collectors.enabled` flag.
+Collectors are enabled by providing a `--collector.<name>` flag.
+Collectors that are enabled by default can be disabled by providing a `--no-collector.<name>` flag.
 
 ### Enabled by default
 
@@ -44,6 +45,7 @@ sockstat | Exposes various statistics from `/proc/net/sockstat`. | Linux
 stat | Exposes various statistics from `/proc/stat`. This includes boot time, forks and interrupts. | Linux
 textfile | Exposes statistics read from local disk. The `--collector.textfile.directory` flag must be set. | _any_
 time | Exposes the current system time. | _any_
+timex | Exposes selected adjtimex(2) system call stats. | Linux
 uname | Exposes system information as provided by the uname system call. | Linux
 vmstat | Exposes statistics from `/proc/vmstat`. | Linux
 wifi | Exposes WiFi device and station statistics. | Linux
@@ -64,6 +66,7 @@ logind | Exposes session counts from [logind](http://www.freedesktop.org/wiki/So
 meminfo\_numa | Exposes memory statistics from `/proc/meminfo_numa`. | Linux
 mountstats | Exposes filesystem statistics from `/proc/self/mountstats`. Exposes detailed NFS client statistics. | Linux
 nfs | Exposes NFS client statistics from `/proc/net/rpc/nfs`. This is the same information as `nfsstat -c`. | Linux
+ntp | Exposes local NTP daemon health to check [time](./docs/TIME.md) | _any_
 qdisc | Exposes [queuing discipline](https://en.wikipedia.org/wiki/Network_scheduler#Linux_kernel) statistics | Linux
 runit | Exposes service status from [runit](http://smarden.org/runit/). | _any_
 supervisord | Exposes service status from [supervisord](http://supervisord.org/). | _any_
@@ -78,7 +81,6 @@ Name     | Description | OS
 ---------|-------------|----
 gmond | Exposes statistics from Ganglia. | _any_
 megacli | Exposes RAID statistics from MegaCLI. | Linux
-ntp | Exposes time drift from an NTP server. | _any_
 
 ### Textfile Collector
 
@@ -105,7 +107,47 @@ echo 'role{role="application_server"} 1' > /path/to/directory/role.prom.$$
 mv /path/to/directory/role.prom.$$ /path/to/directory/role.prom
 ```
 
+### Filtering enabled collectors
+
+The node_exporter will expose all metrics from enabled collectors by default, but it can be passed an optional list of collectors to filter metrics. The `collect[]` parameter accepts values matching enabled collector names.
+
+This can be useful for specifying different scrape intervals for different collectors in Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: 'node resources'
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+        - '192.168.1.2:9100'
+    params:
+      collect[]:
+        - cpu
+        - meminfo
+        - diskstats
+        - netdev
+        - netstat
+
+  - job_name: 'node storage'
+    scrape_interval: 1m
+    static_configs:
+      - targets:
+        - '192.168.1.2:9100'
+    params:
+      collect[]:
+        - filefd
+        - filesystem
+        - xfs
+```
+
 ## Building and running
+
+Prerequisites:
+
+* [Go compiler](https://golang.org/dl/)
+* RHEL/CentOS: `glibc-static` package.
+
+Building:
 
     go get github.com/prometheus/node_exporter
     cd ${GOPATH-$HOME/go}/src/github.com/prometheus/node_exporter
@@ -124,25 +166,15 @@ To see all available configuration flags:
 ## Using Docker
 The node\_exporter is designed to monitor the host system. It's not recommended
 to deploy it as Docker container because it requires access to the host system.
-If you need to run it on Docker, you can deploy this exporter using the
-[node-exporter Docker
-image](https://quay.io/repository/prometheus/node-exporter) with the following
-options and bind-mounts:
+Be aware that any non-root mount points you want to monitor will need bind-mounted
+into the container.
 
 ```bash
-docker run -d -p 9100:9100 \
-  -v "/proc:/host/proc:ro" \
-  -v "/sys:/host/sys:ro" \
-  -v "/:/rootfs:ro" \
+docker run -d \
   --net="host" \
-  quay.io/prometheus/node-exporter \
-    --collector.procfs /host/proc \
-    --collector.sysfs /host/sys \
-    --collector.filesystem.ignored-mount-points "^/(sys|proc|dev|host|etc)($|/)"
+  --pid="host" \
+  quay.io/prometheus/node-exporter
 ```
-
-Be aware though that the mountpoint label in various metrics will now have
-`/rootfs` as prefix.
 
 ## Using a third-party repository for RHEL/CentOS/Fedora
 

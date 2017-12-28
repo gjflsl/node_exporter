@@ -17,8 +17,11 @@ package collector
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/log"
@@ -26,11 +29,16 @@ import (
 )
 
 const (
-	cpuCollectorNamespace = "cpu"
+	cpuCollectorSubsystem = "cpu"
+)
+
+var (
+	digitRegexp = regexp.MustCompile("[0-9]+")
 )
 
 type cpuCollector struct {
 	cpu                *prometheus.Desc
+	cpuGuest           *prometheus.Desc
 	cpuFreq            *prometheus.Desc
 	cpuFreqMin         *prometheus.Desc
 	cpuFreqMax         *prometheus.Desc
@@ -39,41 +47,47 @@ type cpuCollector struct {
 }
 
 func init() {
-	Factories["cpu"] = NewCPUCollector
+	registerCollector("cpu", defaultEnabled, NewCPUCollector)
 }
 
 // NewCPUCollector returns a new Collector exposing kernel/system statistics.
 func NewCPUCollector() (Collector, error) {
 	return &cpuCollector{
 		cpu: prometheus.NewDesc(
-			prometheus.BuildFQName(Namespace, "", cpuCollectorNamespace),
+			prometheus.BuildFQName(namespace, "", cpuCollectorSubsystem),
 			"Seconds the cpus spent in each mode.",
 			[]string{"cpu", "mode"}, nil,
 		),
+		cpuGuest: prometheus.NewDesc(
+			prometheus.BuildFQName(namespace, cpuCollectorSubsystem, "guest_seconds_total"),
+			"Seconds the cpus spent in guests (VMs) for each mode.",
+			[]string{"cpu", "mode"}, nil,
+		),
 		cpuFreq: prometheus.NewDesc(
-			prometheus.BuildFQName(Namespace, cpuCollectorNamespace, "frequency_hertz"),
+			prometheus.BuildFQName(namespace, cpuCollectorSubsystem, "frequency_hertz"),
 			"Current cpu thread frequency in hertz.",
 			[]string{"cpu"}, nil,
 		),
 		cpuFreqMin: prometheus.NewDesc(
-			prometheus.BuildFQName(Namespace, cpuCollectorNamespace, "frequency_min_hertz"),
+			prometheus.BuildFQName(namespace, cpuCollectorSubsystem, "frequency_min_hertz"),
 			"Minimum cpu thread frequency in hertz.",
 			[]string{"cpu"}, nil,
 		),
 		cpuFreqMax: prometheus.NewDesc(
-			prometheus.BuildFQName(Namespace, cpuCollectorNamespace, "frequency_max_hertz"),
+			prometheus.BuildFQName(namespace, cpuCollectorSubsystem, "frequency_max_hertz"),
 			"Maximum cpu thread frequency in hertz.",
 			[]string{"cpu"}, nil,
 		),
+		// FIXME: This should be a per core metric, not per cpu!
 		cpuCoreThrottle: prometheus.NewDesc(
-			prometheus.BuildFQName(Namespace, cpuCollectorNamespace, "core_throttles_total"),
+			prometheus.BuildFQName(namespace, cpuCollectorSubsystem, "core_throttles_total"),
 			"Number of times this cpu core has been throttled.",
 			[]string{"cpu"}, nil,
 		),
 		cpuPackageThrottle: prometheus.NewDesc(
-			prometheus.BuildFQName(Namespace, cpuCollectorNamespace, "package_throttles_total"),
+			prometheus.BuildFQName(namespace, cpuCollectorSubsystem, "package_throttles_total"),
 			"Number of times this cpu package has been throttled.",
-			[]string{"cpu"}, nil,
+			[]string{"node"}, nil,
 		),
 	}, nil
 }
@@ -98,43 +112,78 @@ func (c *cpuCollector) updateCPUfreq(ch chan<- prometheus.Metric) error {
 
 	var value uint64
 
+	// cpu loop
 	for _, cpu := range cpus {
 		_, cpuname := filepath.Split(cpu)
 
 		if _, err := os.Stat(filepath.Join(cpu, "cpufreq")); os.IsNotExist(err) {
-			log.Debugf("CPU %q is missing cpufreq", cpu)
+			log.Debugf("CPU %v is missing cpufreq", cpu)
 		} else {
 			// sysfs cpufreq values are kHz, thus multiply by 1000 to export base units (hz).
 			// See https://www.kernel.org/doc/Documentation/cpu-freq/user-guide.txt
-			if value, err = readUintFromFile(filepath.Join(cpu, "cpufreq/scaling_cur_freq")); err != nil {
+			if value, err = readUintFromFile(filepath.Join(cpu, "cpufreq", "scaling_cur_freq")); err != nil {
 				return err
 			}
 			ch <- prometheus.MustNewConstMetric(c.cpuFreq, prometheus.GaugeValue, float64(value)*1000.0, cpuname)
 
-			if value, err = readUintFromFile(filepath.Join(cpu, "cpufreq/scaling_min_freq")); err != nil {
+			if value, err = readUintFromFile(filepath.Join(cpu, "cpufreq", "scaling_min_freq")); err != nil {
 				return err
 			}
 			ch <- prometheus.MustNewConstMetric(c.cpuFreqMin, prometheus.GaugeValue, float64(value)*1000.0, cpuname)
 
-			if value, err = readUintFromFile(filepath.Join(cpu, "cpufreq/scaling_max_freq")); err != nil {
+			if value, err = readUintFromFile(filepath.Join(cpu, "cpufreq", "scaling_max_freq")); err != nil {
 				return err
 			}
 			ch <- prometheus.MustNewConstMetric(c.cpuFreqMax, prometheus.GaugeValue, float64(value)*1000.0, cpuname)
 		}
 
 		if _, err := os.Stat(filepath.Join(cpu, "thermal_throttle")); os.IsNotExist(err) {
-			log.Debugf("CPU %q is missing thermal_throttle", cpu)
-		} else {
-			if value, err = readUintFromFile(filepath.Join(cpu, "thermal_throttle/core_throttle_count")); err != nil {
-				return err
-			}
-			ch <- prometheus.MustNewConstMetric(c.cpuCoreThrottle, prometheus.CounterValue, float64(value), cpuname)
-
-			if value, err = readUintFromFile(filepath.Join(cpu, "thermal_throttle/package_throttle_count")); err != nil {
-				return err
-			}
-			ch <- prometheus.MustNewConstMetric(c.cpuPackageThrottle, prometheus.CounterValue, float64(value), cpuname)
+			log.Debugf("CPU %v is missing thermal_throttle", cpu)
+			continue
 		}
+		if value, err = readUintFromFile(filepath.Join(cpu, "thermal_throttle", "core_throttle_count")); err != nil {
+			return err
+		}
+		ch <- prometheus.MustNewConstMetric(c.cpuCoreThrottle, prometheus.CounterValue, float64(value), cpuname)
+	}
+
+	nodes, err := filepath.Glob(sysFilePath("bus/node/devices/node[0-9]*"))
+	if err != nil {
+		return err
+	}
+
+	// package / NUMA node loop
+	for _, node := range nodes {
+		if _, err := os.Stat(filepath.Join(node, "cpulist")); os.IsNotExist(err) {
+			log.Debugf("NUMA node %v is missing cpulist", node)
+			continue
+		}
+		cpulist, err := ioutil.ReadFile(filepath.Join(node, "cpulist"))
+		if err != nil {
+			log.Debugf("could not read cpulist of NUMA node %v", node)
+			return err
+		}
+		// cpulist example of one package/node with HT: "0-11,24-35"
+		line := strings.Split(string(cpulist), "\n")[0]
+		if line == "" {
+			// Skip processor-less (memory-only) NUMA nodes.
+			// E.g. RAM expansion with Intel Optane Drive(s) using
+			// Intel Memory Drive Technology (IMDT).
+			log.Debugf("skipping processor-less (memory-only) NUMA node %v", node)
+			continue
+		}
+		firstCPU := strings.FieldsFunc(line, func(r rune) bool {
+			return r == '-' || r == ','
+		})[0]
+		if _, err := os.Stat(filepath.Join(node, "cpu"+firstCPU, "thermal_throttle", "package_throttle_count")); os.IsNotExist(err) {
+			log.Debugf("Node %v CPU %v is missing package_throttle", node, firstCPU)
+			continue
+		}
+		if value, err = readUintFromFile(filepath.Join(node, "cpu"+firstCPU, "thermal_throttle", "package_throttle_count")); err != nil {
+			return err
+		}
+		nodeno := digitRegexp.FindAllString(node, 1)[0]
+		ch <- prometheus.MustNewConstMetric(c.cpuPackageThrottle, prometheus.CounterValue, float64(value), nodeno)
 	}
 
 	return nil
@@ -153,6 +202,7 @@ func (c *cpuCollector) updateStat(ch chan<- prometheus.Metric) error {
 
 	for cpuID, cpuStat := range stats.CPU {
 		cpuName := fmt.Sprintf("cpu%d", cpuID)
+		cpuNum := fmt.Sprintf("%d", cpuID)
 		ch <- prometheus.MustNewConstMetric(c.cpu, prometheus.CounterValue, cpuStat.User, cpuName, "user")
 		ch <- prometheus.MustNewConstMetric(c.cpu, prometheus.CounterValue, cpuStat.Nice, cpuName, "nice")
 		ch <- prometheus.MustNewConstMetric(c.cpu, prometheus.CounterValue, cpuStat.System, cpuName, "system")
@@ -161,8 +211,10 @@ func (c *cpuCollector) updateStat(ch chan<- prometheus.Metric) error {
 		ch <- prometheus.MustNewConstMetric(c.cpu, prometheus.CounterValue, cpuStat.IRQ, cpuName, "irq")
 		ch <- prometheus.MustNewConstMetric(c.cpu, prometheus.CounterValue, cpuStat.SoftIRQ, cpuName, "softirq")
 		ch <- prometheus.MustNewConstMetric(c.cpu, prometheus.CounterValue, cpuStat.Steal, cpuName, "steal")
-		ch <- prometheus.MustNewConstMetric(c.cpu, prometheus.CounterValue, cpuStat.Guest, cpuName, "guest")
-		ch <- prometheus.MustNewConstMetric(c.cpu, prometheus.CounterValue, cpuStat.GuestNice, cpuName, "guest_nice")
+
+		// Guest CPU is also accounted for in cpuStat.User and cpuStat.Nice, expose these as separate metrics.
+		ch <- prometheus.MustNewConstMetric(c.cpuGuest, prometheus.CounterValue, cpuStat.Guest, cpuNum, "user")
+		ch <- prometheus.MustNewConstMetric(c.cpuGuest, prometheus.CounterValue, cpuStat.GuestNice, cpuNum, "nice")
 	}
 
 	return nil
